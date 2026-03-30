@@ -237,10 +237,27 @@ function buildLowInformationFallback(sourceText, replyText = '') {
   return '还没定位到具体答案。';
 }
 
+function looksLikeExplicitLongMemoryRequest(text) {
+  const normalized = String(text ?? '').trim();
+  if (!normalized) {
+    return false;
+  }
+  return /(记住|记一下|记下|长期记忆|写入记忆|写进记忆|加入记忆|加入长期记忆|写入长期记忆|记到长期记忆)/.test(normalized);
+}
+
+function looksLikeLongMemoryConfirmationReply(text) {
+  const normalized = String(text ?? '').trim();
+  if (!normalized || normalized.length > 40) {
+    return false;
+  }
+  return /^(记住了[。！!]?)$|^(已经记住了[。！!]?)$|^(已记住[。！!]?)$|^(已记录[。！!]?)$|^(已记下[。！!]?)$|^(这条已写入长期记忆[。！!]?)$|^(已写入长期记忆[。！!]?)$|^(这条已记入长期记忆[。！!]?)$|^(已记入长期记忆[。！!]?)$/.test(normalized);
+}
+
 async function maybeFilterLowInformationReply(qaClient, logger, sourceText, replyText, options = {}) {
   const normalizedReply = String(replyText ?? '').trim();
   if (!normalizedReply) {
     return {
+      blocked: false,
       text: '',
       startGroupFileDownload: false,
       requestText: '',
@@ -250,10 +267,20 @@ async function maybeFilterLowInformationReply(qaClient, logger, sourceText, repl
   const normalizedSource = String(sourceText ?? '').trim();
   if (!normalizedSource) {
     return {
+      blocked: false,
       text: normalizedReply,
       startGroupFileDownload: false,
       requestText: '',
       reason: ''
+    };
+  }
+  if (looksLikeExplicitLongMemoryRequest(normalizedSource) && looksLikeLongMemoryConfirmationReply(normalizedReply)) {
+    return {
+      blocked: false,
+      text: normalizedReply,
+      startGroupFileDownload: false,
+      requestText: '',
+      reason: 'memory-confirmation-bypass'
     };
   }
 
@@ -291,6 +318,7 @@ async function maybeFilterLowInformationReply(qaClient, logger, sourceText, repl
     const decision = parseLowInformationDecision(raw);
     if (decision.allow) {
       return {
+        blocked: false,
         text: normalizedReply,
         startGroupFileDownload: false,
         requestText: '',
@@ -300,6 +328,7 @@ async function maybeFilterLowInformationReply(qaClient, logger, sourceText, repl
     logger.info(`已拦截低信息回复：${decision.reason || 'no-reason'} | source=${normalizedSource.slice(0, 80)} | reply=${normalizedReply.slice(0, 80)}`);
     if (decision.startGroupFileDownload) {
       return {
+        blocked: true,
         text: '',
         startGroupFileDownload: true,
         requestText: decision.requestText || normalizedSource,
@@ -308,6 +337,7 @@ async function maybeFilterLowInformationReply(qaClient, logger, sourceText, repl
     }
     if (options.onLowInformation === 'fallback') {
       return {
+        blocked: true,
         text: buildLowInformationFallback(normalizedSource, normalizedReply),
         startGroupFileDownload: false,
         requestText: '',
@@ -315,6 +345,7 @@ async function maybeFilterLowInformationReply(qaClient, logger, sourceText, repl
       };
     }
     return {
+      blocked: true,
       text: '',
       startGroupFileDownload: false,
       requestText: '',
@@ -323,6 +354,7 @@ async function maybeFilterLowInformationReply(qaClient, logger, sourceText, repl
   } catch (error) {
     logger.warn(`低信息回复判定失败，回退为原回复：${error.message}`);
     return {
+      blocked: false,
       text: normalizedReply,
       startGroupFileDownload: false,
       requestText: '',
@@ -422,6 +454,8 @@ function buildHelpText(config) {
     '引用一条消息后发送 /chat',
     '引用一条消息后发送 /tr 或 #翻译',
     `群里直接 @${displayName} 也会按 /chat 处理。`,
+    '要写长期记忆时，直接说：记住：内容 或 加入长期记忆：内容',
+    '长期记忆只收稳定事实，不收版本号、时间、群号、用户名、临时安排这类会变的信息。',
     '发送 .msav 文件会自动解析；回复那条地图介绍消息会继续围绕同一张地图聊天。',
     '',
     '/e 状态',
@@ -794,8 +828,30 @@ async function sendChatResultIfPresent(config, qaClient, logger, napcatClient, c
   const streamReplySession = options?.streamReplySession && typeof options.streamReplySession === 'object'
     ? options.streamReplySession
     : null;
-  await streamReplySession?.flushPending?.();
-  const review = await maybeFilterLowInformationReply(qaClient, logger, options?.sourceText, result?.text, options);
+  const maxLowInformationRetries = Math.max(0, Math.min(3, Number(options?.maxLowInformationRetries ?? 1) || 1));
+  let currentResult = result;
+  let review = null;
+
+  for (let attempt = 0; attempt <= maxLowInformationRetries; attempt += 1) {
+    await streamReplySession?.flushPending?.();
+    review = await maybeFilterLowInformationReply(qaClient, logger, options?.sourceText, currentResult?.text, options);
+    if (!review.blocked || review.startGroupFileDownload) {
+      break;
+    }
+    if (!options?.chatSessionManager || !options?.chatInput || attempt >= maxLowInformationRetries) {
+      break;
+    }
+    streamReplySession?.discardPending?.();
+    const feedback = String(review.reason ?? '').trim() || '回复低信息，缺少具体定位或可执行信息。';
+    logger.info(`低信息回复打回主模型重答：attempt=${attempt + 1} reason=${feedback}`);
+    currentResult = await options.chatSessionManager.retryLowInformationReply(
+      context,
+      options.chatInput,
+      currentResult?.text,
+      feedback
+    );
+  }
+
   if (review.startGroupFileDownload && options?.groupFileDownloadManager && context?.messageType === 'group') {
     streamReplySession?.discardPending?.();
     const handoff = await options.groupFileDownloadManager.startGroupDownloadFlowFromTool(
@@ -825,7 +881,7 @@ async function sendChatResultIfPresent(config, qaClient, logger, napcatClient, c
     streamReplySession?.discardPending?.();
     return;
   }
-  const normalizedOriginal = String(result?.text ?? '').trim();
+  const normalizedOriginal = String(currentResult?.text ?? '').trim();
   const normalizedReviewed = String(review.text ?? '').trim();
   if (
     streamReplySession
@@ -1261,6 +1317,8 @@ async function handleCommand(params) {
         sourceText: command.argument || plainTextFromMessage(event?.message, event?.raw_message),
         onLowInformation: 'fallback',
         lowInformationFilterModel: config.qa.lowInformationFilterModel,
+        chatSessionManager,
+        chatInput,
         streamReplySession,
         groupFileDownloadManager
       });
@@ -2036,7 +2094,7 @@ async function main() {
     ]);
     await Promise.race([
       logger.flush(),
-      sleep(5000)
+      new Promise((resolve) => setTimeout(resolve, 5000))
     ]);
   };
 
@@ -2138,6 +2196,8 @@ async function main() {
           sourceText: text,
           onLowInformation: 'fallback',
           lowInformationFilterModel: config.qa.lowInformationFilterModel,
+          chatSessionManager,
+          chatInput,
           streamReplySession,
           groupFileDownloadManager
         });
@@ -2183,6 +2243,8 @@ async function main() {
             sourceText: text,
             onLowInformation: 'suppress',
             lowInformationFilterModel: config.qa.lowInformationFilterModel,
+            chatSessionManager,
+            chatInput,
             streamReplySession,
             groupFileDownloadManager
           });

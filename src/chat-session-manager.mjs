@@ -831,31 +831,8 @@ export class ChatSessionManager {
       };
       this.stateStore.appendChatSessionEntry(sessionKey, userEntry, this.config.answer.maxTimelineMessages);
 
-      const timelineText = buildTimelineBlock(
-        this.stateStore.getChatSession(sessionKey).messages,
-        this.config.answer.contextWindowMessages
-      );
-      const lookupSeedText = String(normalizedInput.text || normalizedInput.historyText).trim();
       const sessionMessages = this.stateStore.getChatSession(sessionKey).messages;
-      const systemPrompt = await this.#buildAnswerSystemPrompt(context, sessionMessages);
-      const ragPrompt = await this.#maybeBuildRagPrompt(lookupSeedText);
-      const codexFolderGuidePrompt = await this.#maybeBuildCodexFolderGuidePrompt(lookupSeedText);
-      const mindustryPrompt = await this.#maybeBuildMindustryKnowledgePrompt(lookupSeedText);
-      const userContent = [
-        '以下是当前共享上下文：',
-        timelineText,
-        '',
-        '以下是本次需要你回答的请求：',
-        normalizedInput.text
-      ].join('\n');
-
-      const requestMessages = [
-        { role: 'system', content: systemPrompt },
-        ...(ragPrompt ? [{ role: 'system', content: ragPrompt }] : []),
-        ...(codexFolderGuidePrompt ? [{ role: 'system', content: codexFolderGuidePrompt }] : []),
-        ...(mindustryPrompt ? [{ role: 'system', content: mindustryPrompt }] : []),
-        { role: 'user', content: normalizedInput.images.length > 0 ? this.#buildMultimodalUserContent(userContent, normalizedInput.images) : userContent }
-      ];
+      const { requestMessages, lookupSeedText } = await this.#buildAnswerRequestMessages(context, normalizedInput, sessionMessages);
 
       const completionRuntimeContext = {
         ...(normalizedInput.runtimeContext ?? {}),
@@ -877,6 +854,83 @@ export class ChatSessionManager {
       }
       await this.stateStore.save();
       if (context.messageType === 'group' && assistantEntry.text) {
+        const snapshot = Array.isArray(this.stateStore.getChatSession(sessionKey).messages)
+          ? this.stateStore.getChatSession(sessionKey).messages.slice()
+          : [];
+        void this.#refreshStructuredGroupMemory(context.groupId, snapshot).catch((error) => {
+          this.logger.warn(`更新群记忆失败：${error.message}`);
+        });
+      }
+      return {
+        text: completion.text,
+        notice: completion.notice || ''
+      };
+    });
+  }
+
+  async retryLowInformationReply(context, input, rejectedReply, reviewReason = '') {
+    const sessionKey = this.buildSessionKey(context);
+    return await this.#runExclusive(sessionKey, async () => {
+      const normalizedInput = this.#normalizeInput(input);
+      if (!normalizedInput.historyText) {
+        throw new Error('聊天内容不能为空');
+      }
+
+      const normalizedRejectedReply = String(rejectedReply ?? '').trim();
+      const currentSession = this.stateStore.getChatSession(sessionKey);
+      const baseMessages = Array.isArray(currentSession?.messages) ? currentSession.messages.slice() : [];
+      const lastEntry = baseMessages.at(-1);
+      const sessionMessages = (
+        normalizedRejectedReply
+        && lastEntry?.role === 'assistant'
+        && String(lastEntry?.text ?? '').trim() === normalizedRejectedReply
+      )
+        ? baseMessages.slice(0, -1)
+        : baseMessages;
+      const { requestMessages, lookupSeedText } = await this.#buildAnswerRequestMessages(context, normalizedInput, sessionMessages);
+      const retryMessages = [
+        ...requestMessages,
+        ...(normalizedRejectedReply ? [{ role: 'assistant', content: normalizedRejectedReply }] : []),
+        {
+          role: 'user',
+          content: [
+            `系统质检打回：上一条回复不能直接发给用户。原因：${String(reviewReason ?? '').trim() || '回复低信息，缺少具体定位或可执行信息。'}`,
+            '请基于当前上下文和你已经拿到的工具结果重新回答。',
+            '不要再发“收到，我看看”“要我现在列出来吗”“还没定位到具体位置”“先去查一下”这类过渡话术。',
+            '如果用户问的是目录、文件、字段、对象、位置、版本或步骤，优先直接给出具体名字、路径、对象名、结论或明确的下一步读取结果。',
+            '如果确实还不能确定，就明确说出还缺哪一个具体读取结果，不要反问用户已经给过的信息。',
+            '不要使用 Markdown。'
+          ].join('\n')
+        }
+      ];
+      const completionRuntimeContext = {
+        ...(normalizedInput.runtimeContext ?? {}),
+        lookupSeedText
+      };
+      const completion = await this.#completeWithReadonlyTools(context, completionRuntimeContext, retryMessages);
+      const assistantText = completion.text || (completion.notice === 'group-file-download-started' ? '[已转交群文件下载流程]' : '');
+
+      if (lastEntry?.role === 'assistant' && String(lastEntry?.text ?? '').trim() === normalizedRejectedReply) {
+        lastEntry.kind = completion.notice === 'group-file-download-started' ? 'tool-handoff' : 'answer';
+        lastEntry.text = assistantText;
+        lastEntry.time = new Date().toISOString();
+        if (!lastEntry.createdAt) {
+          lastEntry.createdAt = lastEntry.time;
+        }
+      } else if (assistantText) {
+        this.stateStore.appendChatSessionEntry(sessionKey, {
+          role: 'assistant',
+          kind: completion.notice === 'group-file-download-started' ? 'tool-handoff' : 'answer',
+          messageId: '',
+          userId: String(context.selfId ?? '').trim(),
+          sender: 'Cain',
+          text: assistantText,
+          time: new Date().toISOString(),
+          createdAt: new Date().toISOString()
+        }, this.config.answer.maxTimelineMessages);
+      }
+      await this.stateStore.save();
+      if (context.messageType === 'group' && assistantText) {
         const snapshot = Array.isArray(this.stateStore.getChatSession(sessionKey).messages)
           ? this.stateStore.getChatSession(sessionKey).messages.slice()
           : [];
@@ -1116,6 +1170,36 @@ export class ChatSessionManager {
   #getEffectiveFilterPrompt(groupId) {
     const override = this.runtimeConfigStore?.getGroupQaOverride(groupId);
     return override?.filterPrompt || this.config.filter.prompt;
+  }
+
+  async #buildAnswerRequestMessages(context, normalizedInput, sessionMessages) {
+    const timelineText = buildTimelineBlock(
+      sessionMessages,
+      this.config.answer.contextWindowMessages
+    );
+    const lookupSeedText = String(normalizedInput.text || normalizedInput.historyText).trim();
+    const systemPrompt = await this.#buildAnswerSystemPrompt(context, sessionMessages);
+    const ragPrompt = await this.#maybeBuildRagPrompt(lookupSeedText);
+    const codexFolderGuidePrompt = await this.#maybeBuildCodexFolderGuidePrompt(lookupSeedText);
+    const mindustryPrompt = await this.#maybeBuildMindustryKnowledgePrompt(lookupSeedText);
+    const userContent = [
+      '以下是当前共享上下文：',
+      timelineText,
+      '',
+      '以下是本次需要你回答的请求：',
+      normalizedInput.text
+    ].join('\n');
+
+    return {
+      lookupSeedText,
+      requestMessages: [
+        { role: 'system', content: systemPrompt },
+        ...(ragPrompt ? [{ role: 'system', content: ragPrompt }] : []),
+        ...(codexFolderGuidePrompt ? [{ role: 'system', content: codexFolderGuidePrompt }] : []),
+        ...(mindustryPrompt ? [{ role: 'system', content: mindustryPrompt }] : []),
+        { role: 'user', content: normalizedInput.images.length > 0 ? this.#buildMultimodalUserContent(userContent, normalizedInput.images) : userContent }
+      ]
+    };
   }
 
   async #buildAnswerSystemPrompt(context, sessionMessages = []) {
@@ -1685,24 +1769,49 @@ export class ChatSessionManager {
       }
     };
 
-    let hallucinationRetried = false;
-
     const finalizeCompletion = async (text = '', notice = '') => {
-      const normalizedText = String(text ?? '').trim();
-      if (notice || !normalizedText) {
-        return { text: normalizedText, notice };
+      let candidateText = String(text ?? '').trim();
+      if (notice || !candidateText) {
+        return { text: candidateText, notice };
       }
-      const checkResult = await this.#maybeRunHallucinationCheck(
-        context,
-        runtimeContext,
-        [...workingMessages, { role: 'assistant', content: normalizedText }],
-        normalizedText
+
+      const maxHallucinationRetries = Math.max(
+        0,
+        Math.min(3, Number(this.config.hallucinationCheck?.maxRewriteAttempts ?? 2) || 2)
       );
-      if (checkResult && typeof checkResult === 'object' && checkResult.hallucinationFeedback && !hallucinationRetried) {
-        hallucinationRetried = true;
+      let retryCount = 0;
+
+      while (candidateText) {
+        const checkResult = await this.#maybeRunHallucinationCheck(
+          context,
+          runtimeContext,
+          [...workingMessages, { role: 'assistant', content: candidateText }],
+          candidateText
+        );
+        if (!checkResult || typeof checkResult === 'string') {
+          return {
+            text: (typeof checkResult === 'string' ? checkResult : candidateText) || candidateText,
+            notice
+          };
+        }
+        if (!checkResult.hallucinationFeedback) {
+          return {
+            text: candidateText,
+            notice
+          };
+        }
+        if (retryCount >= maxHallucinationRetries) {
+          this.logger.warn(`幻觉检查重答超过上限，保留最后一版：feedback=${checkResult.hallucinationFeedback}`);
+          return {
+            text: candidateText,
+            notice
+          };
+        }
+
+        retryCount += 1;
         discardPendingStreamText();
-        this.logger.info(`幻觉检查打回主模型重答：feedback=${checkResult.hallucinationFeedback}`);
-        workingMessages.push({ role: 'assistant', content: normalizedText });
+        this.logger.info(`幻觉检查打回主模型重答：attempt=${retryCount} feedback=${checkResult.hallucinationFeedback}`);
+        workingMessages.push({ role: 'assistant', content: candidateText });
         workingMessages.push({
           role: 'user',
           content: [
@@ -1710,13 +1819,10 @@ export class ChatSessionManager {
             '请基于已有的工具结果重新组织回答，去掉无法确认的具体事实。如果确实不确定，就明确说不确定。不要使用 Markdown。'
           ].join('\n')
         });
-        const retryText = await this.chatClient.complete(workingMessages, buildCompletionOptions());
-        return { text: String(retryText ?? '').trim() || normalizedText, notice };
+        candidateText = String(await this.chatClient.complete(workingMessages, buildCompletionOptions()) ?? '').trim() || candidateText;
       }
-      return {
-        text: (typeof checkResult === 'string' ? checkResult : normalizedText) || normalizedText,
-        notice
-      };
+
+      return { text: '', notice };
     };
 
     const completeDirectAnswer = async (assistantText, reason = '') => {

@@ -334,7 +334,7 @@ pub async fn load_config(config_path: impl AsRef<Path>) -> Result<LoadedConfig> 
                 enabled: true,
                 base_url: get_string(&raw, &["qa", "baseUrl"]).unwrap_or_else(|| shared_ai_base_url.clone()),
                 api_key: get_string(&raw, &["qa", "apiKey"]).unwrap_or_else(|| shared_ai_api_key.clone()),
-                model: get_string(&raw, &["qa", "answer", "model"]).unwrap_or_else(|| "gpt-5.4-mini".to_string()),
+                model: get_string(&raw, &["qa", "answer", "model"]).unwrap_or_else(|| "gpt-5.3-codex".to_string()),
                 temperature: get_f64(&raw, &["qa", "answer", "temperature"]).unwrap_or(0.4),
                 request_timeout_ms: get_i64(&raw, &["qa", "requestTimeoutMs"]).unwrap_or(90_000) as u64,
                 retry_attempts: get_i64(&raw, &["qa", "retryAttempts"]).unwrap_or(3).max(1) as usize,
@@ -351,7 +351,7 @@ pub async fn load_config(config_path: impl AsRef<Path>) -> Result<LoadedConfig> 
                 system_prompt: prompt_review_prompt,
             },
             answer: QaAnswerConfig {
-                model: get_string(&raw, &["qa", "answer", "model"]).unwrap_or_else(|| "gpt-5.4-mini".to_string()),
+                model: get_string(&raw, &["qa", "answer", "model"]).unwrap_or_else(|| "gpt-5.3-codex".to_string()),
                 temperature: get_f64(&raw, &["qa", "answer", "temperature"]).unwrap_or(0.4),
                 max_context_chars: get_i64(&raw, &["qa", "answer", "maxContextChars"]).unwrap_or(80_000).max(2_000) as usize,
                 max_tool_rounds: get_i64(&raw, &["qa", "answer", "maxToolRounds"]).unwrap_or(4).max(1) as usize,

@@ -24,6 +24,18 @@ function isReplySendRejectedError(error) {
       || /result\s*[:=]\s*120/i.test(message));
 }
 
+function isBenignGroupSystemMessageTimeoutError(error) {
+  const message = String(error?.message ?? '');
+  if (!message) {
+    return false;
+  }
+  return message.includes('get_group_system_msg')
+    && message.includes('Timeout')
+    && message.includes('getSingleScreenNotifies')
+    && message.includes('"result": 0')
+    && message.includes('"errMsg": "success"');
+}
+
 function flattenMessageText(message) {
   if (typeof message === 'string') {
     return message;
@@ -172,7 +184,17 @@ export class NapCatClient {
   }
 
   async getGroupSystemMessages(count = 50) {
-    return await this.call('get_group_system_msg', { count });
+    try {
+      return await this.call('get_group_system_msg', { count });
+    } catch (error) {
+      if (!isBenignGroupSystemMessageTimeoutError(error)) {
+        throw error;
+      }
+      return {
+        invited_requests: [],
+        InvitedRequest: []
+      };
+    }
   }
 
   async setGroupCard(groupId, userId, card = '') {

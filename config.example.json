@@ -83,7 +83,7 @@
       "promptFile": "./prompts/qa-prompt-review.txt"
     },
     "answer": {
-      "model": "gpt-5.4-mini",
+      "model": "gpt-5.3-codex",
       "temperature": 0.4,
       "maxContextChars": 80000,
       "maxToolRounds": 4,

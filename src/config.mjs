@@ -430,7 +430,7 @@ export async function loadConfig(configPath) {
         enabled: true,
         baseUrl: qaBaseUrl,
         apiKey: qaApiKey,
-        model: raw?.qa?.answer?.model ?? 'gpt-5.4-mini',
+        model: raw?.qa?.answer?.model ?? 'gpt-5.3-codex',
         temperature: raw?.qa?.answer?.temperature ?? 0.4,
         requestTimeoutMs: raw?.qa?.requestTimeoutMs ?? answerRaw?.requestTimeoutMs ?? 90000,
         retryAttempts: raw?.qa?.retryAttempts ?? answerRaw?.retryAttempts ?? 3,
@@ -449,7 +449,7 @@ export async function loadConfig(configPath) {
         systemPrompt: promptReviewPrompt
       },
       answer: {
-        model: raw?.qa?.answer?.model ?? 'gpt-5.4-mini',
+        model: raw?.qa?.answer?.model ?? 'gpt-5.3-codex',
         temperature: raw?.qa?.answer?.temperature ?? answerRaw?.temperature ?? 0.4,
         maxContextChars: raw?.qa?.answer?.maxContextChars ?? 80000,
         maxToolRounds: raw?.qa?.answer?.maxToolRounds ?? answerRaw?.maxToolRounds ?? 4,
